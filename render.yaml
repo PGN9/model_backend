@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: nli-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python src/main.py
+    plan: starter
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0

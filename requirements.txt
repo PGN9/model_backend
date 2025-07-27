@@ -4,3 +4,4 @@ pydantic
 vaderSentiment
 psutil
 transformers
+torch

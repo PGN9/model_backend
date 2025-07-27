@@ -71,7 +71,7 @@ async def startup_event():
 
     # Load ONNX model with limited threads
     so = ort.SessionOptions()
-    so.intra_op_num_threads = 1
+    so.intra_op_num_threads = 2
     session = ort.InferenceSession(ONNX_MODEL_PATH, sess_options=so, providers=["CPUExecutionProvider"])
 
     model_ready = True

@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import AutoTokenizer
 import onnxruntime as ort
 import numpy as np
@@ -63,20 +63,16 @@ def health_check():
         "status": "backend is alive",
         "message": "Emotion ONNX model is running."
     }
-
+import platform
+import resource
 
 @app.post("/predict")
-async def predict(request: CommentsRequest):  # ⬅️ Make this `async def`
+async def predict(request: CommentsRequest):
     async with semaphore:
         try:
-            # === Memory usage before ===
             process = psutil.Process(os.getpid())
             initial_memory_mb = process.memory_info().rss / (1024 * 1024)
 
-            start_time = time.time()
-            logger.info(f"Received {len(request.comments)} comments for prediction.")
-
-            # === Measure request data size ===
             request_json = request.model_dump()
             request_bytes = json.dumps(request_json).encode("utf-8")
             request_size_kb = len(request_bytes) / 1024
@@ -84,80 +80,68 @@ async def predict(request: CommentsRequest):  # ⬅️ Make this `async def`
             texts = [c.body for c in request.comments]
             ids = [c.id for c in request.comments]
 
-            results = []
+            async def stream_results():
+                for i in range(0, len(texts), BATCH_SIZE):
+                    batch_texts = texts[i:i + BATCH_SIZE]
+                    batch_ids = ids[i:i + BATCH_SIZE]
 
-            for i in range(0, len(texts), BATCH_SIZE):
-                batch_texts = texts[i:i + BATCH_SIZE]
-                batch_ids = ids[i:i + BATCH_SIZE]
+                    inputs = tokenizer(
+                        batch_texts,
+                        return_tensors="np",
+                        padding=True,
+                        truncation=True,
+                        max_length=512
+                    )
 
-                logger.info(f"Processing batch {i // BATCH_SIZE + 1} - size {len(batch_texts)}")
+                    onnx_inputs = {
+                        "input_ids": inputs["input_ids"],
+                        "attention_mask": inputs["attention_mask"]
+                    }
 
-                inputs = tokenizer(
-                    batch_texts,
-                    return_tensors="np",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                )
-                logger.info("Tokenization complete.")
+                    logits = session.run(None, onnx_inputs)[0]
+                    probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
 
-                onnx_inputs = {
-                    "input_ids": inputs["input_ids"],
-                    "attention_mask": inputs["attention_mask"]
+                    for j, p in enumerate(probs):
+                        emotion_list = [label for k, label in enumerate(LABELS) if p[k] > THRESHOLD]
+                        emotion_scores = [{"label": label, "score": round(float(p[k]), 4)} for k, label in enumerate(LABELS)]
+
+                        result = {
+                            "type": "result",
+                            "id": batch_ids[j],
+                            "emotions": emotion_list,
+                            "emotion_scores": emotion_scores
+                        }
+
+                        yield json.dumps(result) + "\n"
+                        await asyncio.sleep(0)
+
+                    del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs
+                    gc.collect()
+
+                # Calculate peak memory cross-platform
+                current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                if platform.system() == "Windows":
+                    peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / (1024 * 1024)
+                elif platform.system() == "Linux":
+                    peak_memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    peak_memory_mb = peak_memory_kb / 1024
+                elif platform.system() == "Darwin":
+                    peak_memory_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    peak_memory_mb = peak_memory_bytes / (1024 * 1024)
+                else:
+                    peak_memory_mb = current_memory_mb
+
+                # Yield final stats
+                stats = {
+                    "type": "stats",
+                    "model_used": MODEL_ID,
+                    "memory_initial_mb": round(initial_memory_mb, 2),
+                    "memory_peak_mb": round(peak_memory_mb, 2),
+                    "total_data_size_kb": round(request_size_kb, 2)
                 }
+                yield json.dumps(stats) + "\n"
 
-                logits = session.run(None, onnx_inputs)[0]
-                logger.info("ONNX model inference complete.")
-
-                probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
-                logger.info("Softmax probabilities computed.")
-
-                for j, p in enumerate(probs):
-                    emotion_list = [label for k, label in enumerate(LABELS) if p[k] > THRESHOLD]
-                    emotion_scores = [{"label": label, "score": round(float(p[k]), 4)} for k, label in enumerate(LABELS)]
-
-                    results.append({
-                        "id": batch_ids[j],
-                        "emotions": emotion_list,
-                        "emotion_scores": emotion_scores
-                    })
-
-                logger.info(f"Batch {i // BATCH_SIZE + 1} processed. Results so far: {len(results)}")
-                del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs
-                gc.collect()
-
-            # === Memory usage check (cross-platform) ===
-            current_memory_mb = process.memory_info().rss / (1024 * 1024)
-
-            # Cross-platform peak memory check
-            import platform
-            if platform.system() == "Windows":
-                peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / (1024 * 1024)
-            elif platform.system() == "Linux":
-                import resource
-                peak_memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                peak_memory_mb = peak_memory_kb / 1024
-            elif platform.system() == "Darwin":  # macOS
-                import resource
-                peak_memory_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                peak_memory_mb = peak_memory_bytes / (1024 * 1024)
-            else:
-                peak_memory_mb = current_memory_mb  # fallback
-
-            # === Measure return data size ===
-            response_payload = {
-                "model_used": MODEL_ID,
-                "memory_initial_mb": round(initial_memory_mb, 2),
-                "memory_peak_mb": round(peak_memory_mb, 2),
-                "total_data_size_kb": round(request_size_kb, 2),
-                "total_return_size_kb": round(len(json.dumps({"results": results}).encode("utf-8")) / 1024, 2),
-                "results": results
-            }
-
-
-            logger.info(f"Final response: {len(results)} results, response size: {response_payload['total_return_size_kb']} KB")
-
-            return response_payload
+            return StreamingResponse(stream_results(), media_type="application/json")
 
         except Exception as e:
             logger.error("Exception during prediction", exc_info=True)

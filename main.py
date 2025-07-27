@@ -94,7 +94,6 @@ async def predict(request: CommentsRequest):
         process = psutil.Process(os.getpid())
         initial_memory_mb = process.memory_info().rss / (1024 * 1024)
 
-        # Reject early if memory is too high
         if initial_memory_mb > 480:
             logger.warning("Memory pressure too high — rejecting request")
             return JSONResponse(status_code=503, content={"error": "Memory pressure too high"})
@@ -108,79 +107,88 @@ async def predict(request: CommentsRequest):
 
         async def stream_results():
             total_response_bytes = 0
+            try:
+                for i in range(0, len(texts), BATCH_SIZE):
+                    batch_texts = texts[i:i + BATCH_SIZE]
+                    batch_ids = ids[i:i + BATCH_SIZE]
 
-            for i in range(0, len(texts), BATCH_SIZE):
-                batch_texts = texts[i:i + BATCH_SIZE]
-                batch_ids = ids[i:i + BATCH_SIZE]
+                    inputs = tokenizer(
+                        batch_texts,
+                        return_tensors="np",
+                        padding=True,
+                        truncation=True,
+                        max_length=512
+                    )
 
-                inputs = tokenizer(
-                    batch_texts,
-                    return_tensors="np",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                )
-
-                onnx_inputs = {
-                    "input_ids": inputs["input_ids"],
-                    "attention_mask": inputs["attention_mask"]
-                }
-
-                try:
-                    logits = (await asyncio.wait_for(
-                        asyncio.to_thread(session.run, None, onnx_inputs),
-                        timeout=TIMEOUT_SECONDS
-                    ))[0]
-                except asyncio.TimeoutError:
-                    logger.error("Inference call timed out.")
-                    raise HTTPException(status_code=504, detail="Inference timed out")
-
-                probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
-
-                for j, p in enumerate(probs):
-                    emotion_list = [label for k, label in enumerate(LABELS) if p[k] > THRESHOLD]
-                    emotion_scores = [{"label": label, "score": round(float(p[k]), 4)} for k, label in enumerate(LABELS)]
-
-                    result = {
-                        "type": "result",
-                        "id": batch_ids[j],
-                        "emotions": emotion_list,
-                        "emotion_scores": emotion_scores
+                    onnx_inputs = {
+                        "input_ids": inputs["input_ids"],
+                        "attention_mask": inputs["attention_mask"]
                     }
 
-                    line = json.dumps(result) + "\n"
-                    total_response_bytes += len(line.encode("utf-8"))
-                    yield line
+                    try:
+                        logits = (await asyncio.wait_for(
+                            asyncio.to_thread(session.run, None, onnx_inputs),
+                            timeout=TIMEOUT_SECONDS
+                        ))[0]
+                    except asyncio.TimeoutError:
+                        logger.error("Inference call timed out.")
+                        raise HTTPException(status_code=504, detail="Inference timed out")
 
+                    probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+
+                    for j, p in enumerate(probs):
+                        emotion_list = [label for k, label in enumerate(LABELS) if p[k] > THRESHOLD]
+                        emotion_scores = [{"label": label, "score": round(float(p[k]), 4)} for k, label in enumerate(LABELS)]
+
+                        result = {
+                            "type": "result",
+                            "id": batch_ids[j],
+                            "emotions": emotion_list,
+                            "emotion_scores": emotion_scores
+                        }
+
+                        line = json.dumps(result) + "\n"
+                        total_response_bytes += len(line.encode("utf-8"))
+                        yield line
+
+                    current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
+
+                    del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs
+                    gc.collect()
+
+                # Memory peak stats
                 current_memory_mb = process.memory_info().rss / (1024 * 1024)
-                logger.info(f"Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
+                if platform.system() == "Windows":
+                    peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / (1024 * 1024)
+                elif platform.system() == "Linux":
+                    peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                elif platform.system() == "Darwin":
+                    peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+                else:
+                    peak_memory_mb = current_memory_mb
 
-                del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs
-                gc.collect()
+                stats = {
+                    "type": "stats",
+                    "model_used": MODEL_ID,
+                    "memory_initial_mb": round(initial_memory_mb, 2),
+                    "memory_peak_mb": round(peak_memory_mb, 2),
+                    "total_data_size_kb": round(request_size_kb, 2),
+                    "total_return_size_kb": round(total_response_bytes / 1024, 2)
+                }
 
-            # Peak memory detection (platform-specific)
-            current_memory_mb = process.memory_info().rss / (1024 * 1024)
-            if platform.system() == "Windows":
-                peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / (1024 * 1024)
-            elif platform.system() == "Linux":
-                peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-            elif platform.system() == "Darwin":
-                peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
-            else:
-                peak_memory_mb = current_memory_mb
+                yield json.dumps(stats) + "\n"
 
-            stats = {
-                "type": "stats",
-                "model_used": MODEL_ID,
-                "memory_initial_mb": round(initial_memory_mb, 2),
-                "memory_peak_mb": round(peak_memory_mb, 2),
-                "total_data_size_kb": round(request_size_kb, 2),
-                "total_return_size_kb": round(total_response_bytes / 1024, 2)
-            }
+            except asyncio.CancelledError:
+                logger.warning("Streaming task was cancelled — likely due to Render timeout.")
+                raise HTTPException(status_code=504, detail="Task was cancelled by host")
 
-            yield json.dumps(stats) + "\n"
-
-        return StreamingResponse(stream_results(), media_type="application/x-ndjson")
+        # Wrap stream with an outer timeout to catch overall delays
+        return StreamingResponse(
+            stream_results(),
+            media_type="application/x-ndjson",
+            headers={"Connection": "keep-alive"}
+        )
 
     except Exception as e:
         logger.error("Exception during prediction", exc_info=True)

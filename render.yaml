@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: moritz-zeroshot-backend
+    env: python
+    region: oregon  # or use frankfurt/singapore depending on your location
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8000

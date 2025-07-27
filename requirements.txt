@@ -4,3 +4,6 @@ pydantic
 vaderSentiment
 psutil
 sentence_transformers
+onnx
+optimum
+onnxruntime

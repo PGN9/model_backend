@@ -10,7 +10,7 @@ import numpy as np
 import psutil, platform, time, os, json, traceback, requests
 
 MODEL_ID = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
-ONNX_URL = "https://huggingface.co/Ndi2020/MoritzLaurermultilingual-MiniLMv2-L6-mnli-xnli/resolve/main/model-quant.onnx"
+ONNX_URL = "https://huggingface.co/Ndi2020/MoritzLaurermultilingual-MiniLMv2-L6-mnli-xnli/resolve/main/model.onnx"
 ONNX_PATH = "./onnx_model/model-quant.onnx"
 HYPOTHESIS_TEMPLATE = "This text is about {}."
 ENTAILMENT_IDX = 2  # [contradiction, neutral, entailment]

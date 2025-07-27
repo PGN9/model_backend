@@ -6,3 +6,4 @@ requests
 numpy
 pydantic
 psutil
+python-dotenv

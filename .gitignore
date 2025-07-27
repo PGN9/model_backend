@@ -1,1 +1,33 @@
+# Python
 __pycache__/
+*.py[cod]
+*.so
+.Python
+.env
+.venv/
+venv/
+env/
+
+# Build/Install
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Logs & DBs
+*.log
+*.sqlite
+*.sqlite3
+
+# FastAPI/Frontend
+*.env.local
+.vscode/
+.idea/
+.DS_Store
+
+# ML Models (Avoid committing large files!)
+*.bin
+*.h5
+*.pth
+*.safetensors
+data/  # Local datasets

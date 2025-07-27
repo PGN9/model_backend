@@ -21,7 +21,7 @@ MODEL_ID = "bhadresh-savani/distilbert-base-uncased-emotion"
 ONNX_MODEL_URL = "https://huggingface.co/Ndi2020/bhadresh-emotion-onnx/resolve/main/model-quant.onnx"
 ONNX_MODEL_PATH = "./onnx_model/model-quant.onnx"
 LABELS = ["sadness", "joy", "love", "anger", "fear", "surprise"]
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 THRESHOLD = 0.3
 TIMEOUT_SECONDS = 300  # Render hard timeout
 
@@ -72,6 +72,10 @@ def health_check():
         "message": "Emotion ONNX model is running."
     }
 
+@app.get("/warmup")
+def warmup():
+    return {"status": "warmed"}
+
 @app.get("/metrics")
 def get_metrics():
     process = psutil.Process(os.getpid())
@@ -103,6 +107,8 @@ async def predict(request: CommentsRequest):
         ids = [c.id for c in request.comments]
 
         async def stream_results():
+            total_response_bytes = 0
+
             for i in range(0, len(texts), BATCH_SIZE):
                 batch_texts = texts[i:i + BATCH_SIZE]
                 batch_ids = ids[i:i + BATCH_SIZE]
@@ -142,7 +148,9 @@ async def predict(request: CommentsRequest):
                         "emotion_scores": emotion_scores
                     }
 
-                    yield json.dumps(result) + "\n"
+                    line = json.dumps(result) + "\n"
+                    total_response_bytes += len(line.encode("utf-8"))
+                    yield line
 
                 current_memory_mb = process.memory_info().rss / (1024 * 1024)
                 logger.info(f"Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
@@ -166,8 +174,10 @@ async def predict(request: CommentsRequest):
                 "model_used": MODEL_ID,
                 "memory_initial_mb": round(initial_memory_mb, 2),
                 "memory_peak_mb": round(peak_memory_mb, 2),
-                "total_data_size_kb": round(request_size_kb, 2)
+                "total_data_size_kb": round(request_size_kb, 2),
+                "total_return_size_kb": round(total_response_bytes / 1024, 2)
             }
+
             yield json.dumps(stats) + "\n"
 
         return StreamingResponse(stream_results(), media_type="application/x-ndjson")

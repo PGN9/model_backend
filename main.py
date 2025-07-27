@@ -1,46 +1,115 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from transformers import pipeline
 import os
-import sys
-# DON'T CHANGE THIS !!!
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import psutil
+import json
+import time
+import traceback
 
-from flask import Flask, send_from_directory
-from flask_cors import CORS
-from src.models.user import db
-from src.routes.user import user_bp
-from src.routes.sentiment import nli_bp
+app = FastAPI()
 
-app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), 'static'))
-app.config['SECRET_KEY'] = 'asdf#FGSgvasgf$5$WGT'
+# Enable CORS (for Replit requests)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST"],
+)
 
-# Enable CORS for all routes
-CORS(app)
+MODEL_NAME = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
+LABELS = ["positive", "negative", "delivery issue", "product quality", "neutral"]
+BATCH_SIZE = 50  # Process 50 comments at a time
 
-app.register_blueprint(user_bp, url_prefix='/api')
-app.register_blueprint(nli_bp, url_prefix='/api/nli')
+# Load model (auto GPU/CPU)
+classifier = pipeline(
+    "zero-shot-classification",
+    model=MODEL_NAME,
+    device_map="auto",  # Optimize for GPU if available
+    batch_size=16,     # Faster inference with batches
+)
 
-# Database setup (commented out since not needed for sentiment analysis)
-# app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(os.path.dirname(__file__), 'database', 'app.db')}"
-# app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-# db.init_app(app)
-# with app.app_context():
-#     db.create_all()
+class Comment(BaseModel):
+    id: str
+    body: str
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve(path):
-    static_folder_path = app.static_folder
-    if static_folder_path is None:
-            return "Static folder not configured", 404
+class CommentsRequest(BaseModel):
+    comments: List[Comment]
 
-    if path != "" and os.path.exists(os.path.join(static_folder_path, path)):
-        return send_from_directory(static_folder_path, path)
-    else:
-        index_path = os.path.join(static_folder_path, 'index.html')
-        if os.path.exists(index_path):
-            return send_from_directory(static_folder_path, 'index.html')
-        else:
-            return "index.html not found", 404
+def get_size_in_kb(data: str) -> float:
+    """Calculate size of JSON data in KB."""
+    return len(data.encode("utf-8")) / 1024
 
+@app.get("/")
+def health_check():
+    return {"status": "ready", "model": MODEL_NAME}
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+@app.post("/predict")
+async def predict(request: CommentsRequest):
+    start_time = time.time()
+    process = psutil.Process(os.getpid())
+    initial_memory_mb = process.memory_info().rss / 1024 / 1024
+    input_size_kb = get_size_in_kb(json.dumps(request.model_dump()))
+
+    results = []
+    try:
+        # Process in batches to avoid OOM errors
+        for i in range(0, len(request.comments), BATCH_SIZE):
+            batch = request.comments[i:i + BATCH_SIZE]
+            batch_texts = [comment.body for comment in batch]
+
+            # Batch inference
+            batch_results = classifier(
+                batch_texts,
+                candidate_labels=LABELS,
+                multi_label=True
+            )
+
+            # Format results
+            for comment, result in zip(batch, batch_results):
+                label_scores = {
+                    label: round(score, 4) 
+                    for label, score in zip(result["labels"], result["scores"])
+                }
+                results.append({
+                    "id": comment.id,
+                    "body": comment.body,
+                    "top_label": result["labels"][0],
+                    "label_scores": label_scores
+                })
+
+        # Memory metrics
+        peak_memory_mb = process.memory_info().rss / 1024 / 1024
+        return_size_kb = get_size_in_kb(json.dumps(results))
+        processing_time = time.time() - start_time
+
+        # Response format (matches your goal)
+        return {
+            "model_metrics": {
+                "model_used": MODEL_NAME,
+                "memory_initial_mb": round(initial_memory_mb, 2),
+                "memory_peak_mb": round(peak_memory_mb, 2),
+                "total_data_size_kb": round(input_size_kb, 2),
+                "total_return_size_kb": round(return_size_kb, 2),
+            },
+            "number_of_comments": len(request.comments),
+            "number_updated": len(results),
+            "timing": {
+                "model_processing_time": round(processing_time, 2),
+            },
+            "results": results  # Optional: Include if Replit needs labels
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)  # 1 worker for Render free tier

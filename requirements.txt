@@ -1,5 +1,9 @@
 fastapi
 uvicorn
 pydantic
-vaderSentiment
+transformers==4.39.3
+onnxruntime
+optimum[onnxruntime]
 psutil
+numpy
+requests

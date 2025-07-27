@@ -1,43 +1,61 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
+from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import AutoTokenizer
-from fastapi.responses import JSONResponse
 import onnxruntime as ort
 import numpy as np
-import os
-import psutil
 import requests
-import traceback
-import platform
+import os
 import json
+import gc
+import logging
+import psutil
 import time
 import asyncio
+import platform
+import resource
 
-# === Global Load Flag ===
-model_loaded = False
-
-# === Model Info ===
-MODEL_NAME = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
-ONNX_MODEL_PATH = "./onnx_model/model-quant.onnx"
+# === Config ===
+MODEL_ID = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
 ONNX_MODEL_URL = "https://huggingface.co/dakyswr/lxyuan-distilbert-sentiment-onnx/resolve/main/model-quant.onnx"
+ONNX_MODEL_PATH = "./onnx_model/model-quant.onnx"
+LABELS = ["negative", "neutral", "positive"]
+BATCH_SIZE = 8
+TIMEOUT_SECONDS = 300
 
-# === Download ONNX Model if Needed ===
+# === Logging ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("sentiment-model")
+
+# === Download model if not exists ===
 def download_model():
     if not os.path.exists(ONNX_MODEL_PATH):
-        print("Downloading ONNX model...")
+        logger.info("Downloading quantized ONNX model...")
         os.makedirs(os.path.dirname(ONNX_MODEL_PATH), exist_ok=True)
-        with open(ONNX_MODEL_PATH, "wb") as f:
-            f.write(requests.get(ONNX_MODEL_URL).content)
-        print("Download complete.")
+        for attempt in range(3):
+            try:
+                response = requests.get(ONNX_MODEL_URL, timeout=60)
+                response.raise_for_status()
+                with open(ONNX_MODEL_PATH, "wb") as f:
+                    f.write(response.content)
+                logger.info("Model downloaded successfully.")
+                return
+            except Exception as e:
+                logger.warning(f"Attempt {attempt+1}/3 failed: {e}")
+                time.sleep(2)
+        raise RuntimeError("Failed to download ONNX model after 3 attempts.")
 
 download_model()
 
-# === App Init ===
-app = FastAPI()
-LABEL_MAP = {0: "negative", 1: "neutral", 2: "positive"}
+# === Load model & tokenizer ===
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+process = psutil.Process(os.getpid())
 
-# === Classes ===
+# === FastAPI App ===
+app = FastAPI()
+
 class Comment(BaseModel):
     id: str
     body: str
@@ -45,110 +63,93 @@ class Comment(BaseModel):
 class CommentsRequest(BaseModel):
     comments: List[Comment]
 
-# === Helpers ===
-def get_size_in_kb(data: str) -> float:
-    return len(data.encode("utf-8")) / 1024
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(log_memory_usage())
 
 @app.get("/")
-def root():
-    return {"message": "Welcome! The multilingual ONNX model is live."}
+def health_check():
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    return {"status": "backend is alive", "message": "Sentiment model running."}
 
-# === Health Check Route ===
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.get("/metrics")
+def get_metrics():
+    memory_info = process.memory_info()
+    return {
+        "memory_usage_mb": round(memory_info.rss / (1024 * 1024), 2),
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "num_threads": process.num_threads(),
+        "open_files": len(process.open_files()),
+        "connections": len(process.connections())
+    }
 
-# === Startup Event: Load Tokenizer & Model ===
-@app.on_event("startup")
-async def load_model():
-    global tokenizer, session, model_loaded
-    try:
-        print("🔄 Loading tokenizer and ONNX model...")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        session = ort.InferenceSession(ONNX_MODEL_PATH)
-        
-        # 🔥 Warm-up with a dummy comment
-        dummy_input = tokenizer(["Hello world!"], return_tensors="np", truncation=True, padding=True)
-        _ = session.run(None, {
-            "input_ids": dummy_input["input_ids"],
-            "attention_mask": dummy_input["attention_mask"]
-        })
+async def log_memory_usage():
+    while True:
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
+        await asyncio.sleep(10)
 
-        model_loaded = True
-        print("✅ Model ready and warm-up complete.")
-    except Exception as e:
-        print("❌ Model load failed:", str(e))
-        traceback.print_exc()
-
-
-# === Predict Endpoint ===
 @app.post("/predict")
-async def predict_sentiment(request: CommentsRequest):
-    if not model_loaded:
-        return JSONResponse(status_code=503, content={"error": "Model is not yet loaded."})
-
+async def predict(request: CommentsRequest):
     try:
-        print("📨 Received /predict request")
-        process = psutil.Process(os.getpid())
-        initial_memory_mb = process.memory_info().rss / 1024 / 1024
+        initial_memory_mb = process.memory_info().rss / (1024 * 1024)
 
-        input_json = json.dumps(request.dict())
-        total_data_size_kb = get_size_in_kb(input_json)
+        texts = [c.body for c in request.comments]
+        ids = [c.id for c in request.comments]
+        request_bytes = json.dumps(request.model_dump()).encode("utf-8")
+        request_size_kb = len(request_bytes) / 1024
 
-        texts = [comment.body for comment in request.comments]
-        ids = [comment.id for comment in request.comments]
+        async def stream_results():
+            total_response_bytes = 0
+            for i in range(0, len(texts), BATCH_SIZE):
+                batch_texts = texts[i:i+BATCH_SIZE]
+                batch_ids = ids[i:i+BATCH_SIZE]
 
-        inputs = tokenizer(texts, return_tensors="np", truncation=True, padding=True, max_length=512)
-        onnx_inputs = {
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs["attention_mask"]
-        }
+                inputs = tokenizer(batch_texts, return_tensors="np", padding=True, truncation=True, max_length=512)
+                onnx_inputs = {
+                    "input_ids": inputs["input_ids"],
+                    "attention_mask": inputs["attention_mask"]
+                }
 
-        start_time = time.time()
-        logits = session.run(None, onnx_inputs)[0]  # Shape: (batch_size, 3)
-        elapsed = time.time() - start_time
-        print(f"⏱️ Inference time for {len(texts)} comments: {round(elapsed, 3)} seconds")
+                logits = (await asyncio.to_thread(session.run, None, onnx_inputs))[0]
+                probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+                preds = np.argmax(probs, axis=1)
 
-        probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
-        label_ids = np.argmax(probs, axis=1)
+                for j, (pred_idx, prob) in enumerate(zip(preds, probs)):
+                    label = LABELS[pred_idx]
+                    score = round(float(prob[pred_idx]), 4)
+                    result = {
+                        "type": "result",
+                        "id": batch_ids[j],
+                        "sentiment": label,
+                        "sentiment_score": score
+                    }
+                    line = json.dumps(result) + "\n"
+                    total_response_bytes += len(line.encode("utf-8"))
+                    yield line
 
-        results = []
-        for i, label_id in enumerate(label_ids):
-            results.append({
-                "id": ids[i],
-                "body": texts[i],
-                "sentiment": LABEL_MAP.get(int(label_id), "unknown"),
-                "sentiment_score": round(float(probs[i][label_id]), 4)
-            })
+                del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs, preds
+                gc.collect()
 
-        current_memory_mb = process.memory_info().rss / 1024 / 1024
-        if platform.system() == "Windows":
-            peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / 1024 / 1024
-        elif platform.system() == "Linux":
-            import resource
-            peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        elif platform.system() == "Darwin":
-            import resource
-            peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
-        else:
-            peak_memory_mb = current_memory_mb
+            current_memory_mb = process.memory_info().rss / (1024 * 1024)
+            peak_memory_mb = (
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss /
+                (1024 if platform.system() == "Linux" else (1024 * 1024))
+            )
 
-        return {
-            "model_used": MODEL_NAME,
-            "results": results,
-            "memory_initial_mb": round(initial_memory_mb, 2),
-            "memory_peak_mb": round(peak_memory_mb, 2),
-            "total_data_size_kb": round(total_data_size_kb, 2),
-            "total_return_size_kb": round(get_size_in_kb(json.dumps(results)), 2)
-        }
+            stats = {
+                "type": "stats",
+                "model_used": MODEL_ID,
+                "memory_initial_mb": round(initial_memory_mb, 2),
+                "memory_peak_mb": round(peak_memory_mb, 2),
+                "total_data_size_kb": round(request_size_kb, 2),
+                "total_return_size_kb": round(total_response_bytes / 1024, 2)
+            }
+
+            yield json.dumps(stats) + "\n"
+
+        return StreamingResponse(stream_results(), media_type="application/x-ndjson")
 
     except Exception as e:
-        print("❌ Error during inference:", str(e))
-        traceback.print_exc()
+        logger.error(f"[PREDICT] Error: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-# === Run Server ===
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)

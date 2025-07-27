@@ -28,6 +28,15 @@ TIMEOUT_SECONDS = 300
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sentiment-model")
 
+# === FastAPI App ===
+app = FastAPI()
+
+# === Global flags ===
+model_ready = False
+tokenizer = None
+session = None
+process = psutil.Process(os.getpid())
+
 # === Download model if not exists ===
 def download_model():
     if not os.path.exists(ONNX_MODEL_PATH):
@@ -46,27 +55,30 @@ def download_model():
                 time.sleep(2)
         raise RuntimeError("Failed to download ONNX model after 3 attempts.")
 
-download_model()
-
-# === Load model & tokenizer ===
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
-process = psutil.Process(os.getpid())
-
-# === FastAPI App ===
-app = FastAPI()
-
-class Comment(BaseModel):
-    id: str
-    body: str
-
-class CommentsRequest(BaseModel):
-    comments: List[Comment]
-
+# === Startup tasks ===
 @app.on_event("startup")
 async def startup_event():
+    global tokenizer, session, model_ready
+
+    # Download model
+    download_model()
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+    # Disable ONNX memory arena
+    os.environ["ORT_DISABLE_MEMORY_ARENA"] = "1"
+
+    # Load ONNX model with limited threads
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1
+    session = ort.InferenceSession(ONNX_MODEL_PATH, sess_options=so, providers=["CPUExecutionProvider"])
+
+    model_ready = True
+    logger.info("Model is ready.")
     asyncio.create_task(log_memory_usage())
 
+# === Routes ===
 @app.get("/")
 def health_check():
     mem_mb = process.memory_info().rss / (1024 * 1024)
@@ -83,14 +95,18 @@ def get_metrics():
         "connections": len(process.connections())
     }
 
-async def log_memory_usage():
-    while True:
-        mem_mb = process.memory_info().rss / (1024 * 1024)
-        logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
-        await asyncio.sleep(10)
+class Comment(BaseModel):
+    id: str
+    body: str
+
+class CommentsRequest(BaseModel):
+    comments: List[Comment]
 
 @app.post("/predict")
 async def predict(request: CommentsRequest):
+    if not model_ready:
+        raise HTTPException(status_code=503, detail="Model not ready yet. Please retry.")
+
     try:
         initial_memory_mb = process.memory_info().rss / (1024 * 1024)
 
@@ -153,3 +169,10 @@ async def predict(request: CommentsRequest):
     except Exception as e:
         logger.error(f"[PREDICT] Error: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+# === Memory Monitor Task ===
+async def log_memory_usage():
+    while True:
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
+        await asyncio.sleep(10)

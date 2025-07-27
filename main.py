@@ -21,7 +21,7 @@ MODEL_ID = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
 ONNX_MODEL_URL = "https://huggingface.co/dakyswr/lxyuan-distilbert-sentiment-onnx/resolve/main/model-quant.onnx"
 ONNX_MODEL_PATH = "./onnx_model/model-quant.onnx"
 LABELS = ["negative", "neutral", "positive"]
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 TIMEOUT_SECONDS = 300
 
 # === Logging ===
@@ -102,12 +102,22 @@ class Comment(BaseModel):
 class CommentsRequest(BaseModel):
     comments: List[Comment]
 
+# === Memory Monitor Task ===
+async def log_memory_usage():
+    while True:
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
+        await asyncio.sleep(10)
+
+# === predict ===
 @app.post("/predict")
 async def predict(request: CommentsRequest):
     if not model_ready:
         raise HTTPException(status_code=503, detail="Model not ready yet. Please retry.")
 
     try:
+        overall_start = time.perf_counter()
+
         initial_memory_mb = process.memory_info().rss / (1024 * 1024)
 
         texts = [c.body for c in request.comments]
@@ -118,14 +128,16 @@ async def predict(request: CommentsRequest):
         async def stream_results():
             total_response_bytes = 0
             num_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE  # total number of batches
+
             for i in range(0, len(texts), BATCH_SIZE):
+                batch_start = time.perf_counter()
                 batch_num = (i // BATCH_SIZE) + 1
                 batch_texts = texts[i:i + BATCH_SIZE]
                 batch_ids = ids[i:i + BATCH_SIZE]
 
-                logger.info(f"Processing batch {batch_num}/{num_batches} with {len(batch_texts)} comments.")
+                logger.info(f"Starting processing batch {batch_num}/{num_batches} with {len(batch_texts)} comments.")
 
-                inputs = tokenizer(batch_texts, return_tensors="np", padding=True, truncation=True, max_length=512)
+                inputs = tokenizer(batch_texts, return_tensors="np", padding=True, truncation=True, max_length=256)
                 onnx_inputs = {
                     "input_ids": inputs["input_ids"],
                     "attention_mask": inputs["attention_mask"]
@@ -148,6 +160,10 @@ async def predict(request: CommentsRequest):
                     total_response_bytes += len(line.encode("utf-8"))
                     yield line
 
+                batch_end = time.perf_counter()
+                batch_duration = batch_end - batch_start
+                logger.info(f"Finished batch {batch_num}/{num_batches} in {batch_duration:.3f} seconds.")
+
                 del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs, preds
                 gc.collect()
 
@@ -168,16 +184,13 @@ async def predict(request: CommentsRequest):
 
             yield json.dumps(stats) + "\n"
 
-        return StreamingResponse(stream_results(), media_type="application/x-ndjson")
+        response = StreamingResponse(stream_results(), media_type="application/x-ndjson")
+
+        overall_end = time.perf_counter()
+        logger.info(f"Total /predict request handling time: {overall_end - overall_start:.3f} seconds.")
+
+        return response
 
     except Exception as e:
         logger.error(f"[PREDICT] Error: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# === Memory Monitor Task ===
-async def log_memory_usage():
-    while True:
-        mem_mb = process.memory_info().rss / (1024 * 1024)
-        logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
-        await asyncio.sleep(10)

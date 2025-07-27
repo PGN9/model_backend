@@ -27,8 +27,8 @@ BATCH_SIZE = 50  # Process 50 comments at a time
 classifier = pipeline(
     "zero-shot-classification",
     model=MODEL_NAME,
-    device_map="auto",  # Optimize for GPU if available
-    batch_size=16,     # Faster inference with batches
+    device=0 if torch.cuda.is_available() else -1,
+    batch_size=16
 )
 
 class Comment(BaseModel):

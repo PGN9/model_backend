@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 pydantic
-vaderSentiment
+transformers==4.39.3
+torch
 psutil

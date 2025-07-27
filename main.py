@@ -27,7 +27,8 @@ def download_if_needed():
 
 download_if_needed()
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+
 
 so = ort.SessionOptions()
 so.intra_op_num_threads = 1

@@ -1,6 +1,5 @@
-# requirements.txt
-transformers[torch]>=4.39.3  # Installs lightweight PyTorch
-fastapi
-uvicorn
-pydantic
-psutil
+torch==2.0.1+cpu  # CPU-only PyTorch build
+transformers==4.39.3
+fastapi==0.68.0
+uvicorn==0.15.0
+pydantic==1.10.2

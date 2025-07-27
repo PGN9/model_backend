@@ -58,6 +58,8 @@ session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider
 # === FastAPI App ===
 app = FastAPI()
 
+process = psutil.Process(os.getpid())
+
 class Comment(BaseModel):
     id: str
     body: str
@@ -65,8 +67,21 @@ class Comment(BaseModel):
 class CommentsRequest(BaseModel):
     comments: List[Comment]
 
+# Background task to log memory usage every 10 seconds
+async def log_memory_usage():
+    while True:
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
+        await asyncio.sleep(10)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(log_memory_usage())
+
 @app.get("/")
 def health_check():
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    logger.info(f"[HEALTH CHECK] Memory usage: {mem_mb:.2f} MB")
     return {
         "status": "backend is alive",
         "message": "Emotion ONNX model is running."
@@ -74,11 +89,11 @@ def health_check():
 
 @app.get("/warmup")
 def warmup():
+    logger.info("[WARMUP] Received warmup request")
     return {"status": "warmed"}
 
 @app.get("/metrics")
 def get_metrics():
-    process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
     return {
         "memory_usage_mb": round(memory_info.rss / (1024 * 1024), 2),
@@ -91,16 +106,17 @@ def get_metrics():
 @app.post("/predict")
 async def predict(request: CommentsRequest):
     try:
-        process = psutil.Process(os.getpid())
         initial_memory_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[PREDICT] Initial memory usage: {initial_memory_mb:.2f} MB")
 
         if initial_memory_mb > 480:
-            logger.warning("Memory pressure too high — rejecting request")
+            logger.warning("[PREDICT] Memory pressure too high — rejecting request")
             return JSONResponse(status_code=503, content={"error": "Memory pressure too high"})
 
         request_json = request.model_dump()
         request_bytes = json.dumps(request_json).encode("utf-8")
         request_size_kb = len(request_bytes) / 1024
+        logger.info(f"[PREDICT] Request size: {request_size_kb:.2f} KB")
 
         texts = [c.body for c in request.comments]
         ids = [c.id for c in request.comments]
@@ -131,7 +147,7 @@ async def predict(request: CommentsRequest):
                             timeout=TIMEOUT_SECONDS
                         ))[0]
                     except asyncio.TimeoutError:
-                        logger.error("Inference call timed out.")
+                        logger.error("[PREDICT] Inference call timed out.")
                         raise HTTPException(status_code=504, detail="Inference timed out")
 
                     probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
@@ -152,7 +168,7 @@ async def predict(request: CommentsRequest):
                         yield line
 
                     current_memory_mb = process.memory_info().rss / (1024 * 1024)
-                    logger.info(f"Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
+                    logger.info(f"[PREDICT] Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
 
                     del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs
                     gc.collect()
@@ -180,10 +196,9 @@ async def predict(request: CommentsRequest):
                 yield json.dumps(stats) + "\n"
 
             except asyncio.CancelledError:
-                logger.warning("Streaming task was cancelled — likely due to Render timeout.")
+                logger.warning("[PREDICT] Streaming task was cancelled — likely due to Render timeout.")
                 raise HTTPException(status_code=504, detail="Task was cancelled by host")
 
-        # Wrap stream with an outer timeout to catch overall delays
         return StreamingResponse(
             stream_results(),
             media_type="application/x-ndjson",
@@ -191,5 +206,5 @@ async def predict(request: CommentsRequest):
         )
 
     except Exception as e:
-        logger.error("Exception during prediction", exc_info=True)
+        logger.error("[PREDICT] Exception during prediction", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})

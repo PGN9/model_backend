@@ -117,9 +117,13 @@ async def predict(request: CommentsRequest):
 
         async def stream_results():
             total_response_bytes = 0
+            num_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE  # total number of batches
             for i in range(0, len(texts), BATCH_SIZE):
-                batch_texts = texts[i:i+BATCH_SIZE]
-                batch_ids = ids[i:i+BATCH_SIZE]
+                batch_num = (i // BATCH_SIZE) + 1
+                batch_texts = texts[i:i + BATCH_SIZE]
+                batch_ids = ids[i:i + BATCH_SIZE]
+
+                logger.info(f"Processing batch {batch_num}/{num_batches} with {len(batch_texts)} comments.")
 
                 inputs = tokenizer(batch_texts, return_tensors="np", padding=True, truncation=True, max_length=512)
                 onnx_inputs = {
@@ -169,6 +173,7 @@ async def predict(request: CommentsRequest):
     except Exception as e:
         logger.error(f"[PREDICT] Error: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 # === Memory Monitor Task ===
 async def log_memory_usage():

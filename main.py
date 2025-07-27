@@ -93,9 +93,10 @@ def get_peak_mb() -> float:
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
     return max(cur, peak)
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Emotion classification ONNX backend running."}
+
 
 @app.post("/predict")
 def predict(req: EmotionRequest):

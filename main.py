@@ -63,6 +63,21 @@ def health_check():
         "status": "backend is alive",
         "message": "Emotion ONNX model is running."
     }
+
+@app.get("/metrics")
+def get_metrics():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    cpu_percent = psutil.cpu_percent(interval=None) # Non-blocking
+
+    return {
+        "memory_usage_mb": round(memory_info.rss / (1024 * 1024), 2),
+        "cpu_percent": cpu_percent,
+        "num_threads": process.num_threads(),
+        "open_files": len(process.open_files()),
+        "connections": len(process.connections())
+    }
+
 import platform
 import resource
 
@@ -98,7 +113,16 @@ async def predict(request: CommentsRequest):
                         "attention_mask": inputs["attention_mask"]
                     }
 
-                    logits = session.run(None, onnx_inputs)[0]
+                    try:
+                        # Use asyncio.to_thread to run the blocking ONNX inference in a separate thread
+                        logits = (await asyncio.wait_for(
+                            asyncio.to_thread(session.run, None, onnx_inputs),
+                            timeout=TIMEOUT_SECONDS
+                        ))[0]
+                    except asyncio.TimeoutError:
+                        logger.error("Inference call timed out.")
+                        raise HTTPException(status_code=504, detail="Inference timed out")
+
                     probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
 
                     for j, p in enumerate(probs):
@@ -146,3 +170,4 @@ async def predict(request: CommentsRequest):
         except Exception as e:
             logger.error("Exception during prediction", exc_info=True)
             return JSONResponse(status_code=500, content={"error": str(e)})
+

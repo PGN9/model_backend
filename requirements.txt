@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+transformers==4.39.3
+onnxruntime
+psutil
+numpy
+requests

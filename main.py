@@ -179,10 +179,10 @@ async def predict(request: CommentsRequest):
                             "attention_mask": encoded_batch["attention_mask"],
                         }
 
-                        logits = (await asyncio.wait_for(
-                            asyncio.to_thread(session.run, None, onnx_inputs),
-                            timeout=TIMEOUT_SECONDS,
-                        ))[0]
+                        logits = await asyncio.wait_for(
+                            asyncio.get_running_loop().run_in_executor(None, session.run, None, onnx_inputs),
+                            timeout=TIMEOUT_SECONDS
+                        )
 
                         probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
                         entailment_probs = probs[:, 0]  # entailment score

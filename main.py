@@ -166,8 +166,6 @@ async def predict(request: CommentsRequest):
 
                 del batch_texts, batch_ids, inputs, onnx_inputs, logits, probs, preds
                 gc.collect()
-                
-                await asyncio.sleep(1.0)  # give backend a break
 
             current_memory_mb = process.memory_info().rss / (1024 * 1024)
             peak_memory_mb = (

@@ -5,3 +5,6 @@ vaderSentiment
 psutil
 transformers
 torch
+onnx
+optimum
+onnxruntime

@@ -1,158 +1,260 @@
 # main.py  (Moritz zero-shot, ONNXRuntime)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import AutoTokenizer
 import onnxruntime as ort
 import numpy as np
-import psutil, platform, time, os, json, traceback, requests
+import requests
+import os
+import json
+import gc
+import logging
+import psutil
+import time
+import asyncio
+import platform
+import resource
 
+
+# === Config ===
 MODEL_ID = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
-ONNX_URL = "https://huggingface.co/Ndi2020/MoritzLaurermultilingual-MiniLMv2-L6-mnli-xnli/resolve/main/model.onnx"
-ONNX_PATH = "./onnx_model/model.onnx"
-HYPOTHESIS_TEMPLATE = "This text is about {}."
-ENTAILMENT_IDX = 2  # [contradiction, neutral, entailment]
+ONNX_MODEL_URL = "https://huggingface.co/Ndi2020/MoritzLaurermultilingual-MiniLMv2-L6-mnli-xnli/resolve/main/model.onnx"
+ONNX_MODEL_PATH = "./onnx_model/model.onnx"
+LABELS = ["entailment", "neutral", "contradiction"]  # typical M-NLI outputs
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Each pair defines a task: [positive_label, neutral_label]
+TOPIC_CANDIDATE_PAIRS = [
+    ("pain language", "neutral (emotion)"),
+    ("desired outcome", "neutral (goal)")
+]
 
-def download_if_needed():
-    if not os.path.exists(ONNX_PATH):
-        os.makedirs(os.path.dirname(ONNX_PATH), exist_ok=True)
-        print("⬇️ Downloading ONNX quantized model…")
-        with open(ONNX_PATH, "wb") as f:
-            f.write(requests.get(ONNX_URL).content)
-        print("✅ Download complete.")
+# Natural language hypotheses to match each label
+HYPOTHESIS_TEMPLATES = {
+    "pain language": "This text expresses emotional pain.",
+    "neutral (emotion)": "This text is emotionally neutral.",
+    "desired outcome": "This text expresses a desired outcome.",
+    "neutral (goal)": "This text does not express any goal or desire."
+}
 
-download_if_needed()
+BATCH_SIZE = 1 # do it one by one
+TIMEOUT_SECONDS = 300  # Render hard timeout
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+
+# === Setup Logging ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("emotion-model")
 
 
-so = ort.SessionOptions()
-so.intra_op_num_threads = 1
-so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-session = ort.InferenceSession(ONNX_PATH, so)
+# === Ensure Model Exists (with retry) ===
+def download_model():
+   if not os.path.exists(ONNX_MODEL_PATH):
+       logger.info("Downloading quantized ONNX model...")
+       os.makedirs(os.path.dirname(ONNX_MODEL_PATH), exist_ok=True)
 
+
+       for attempt in range(3):
+           try:
+               response = requests.get(ONNX_MODEL_URL, timeout=60)
+               response.raise_for_status()
+               with open(ONNX_MODEL_PATH, "wb") as f:
+                   f.write(response.content)
+               logger.info("Model downloaded successfully.")
+               return
+           except Exception as e:
+               logger.warning(f"Attempt {attempt+1}/3 failed: {e}")
+               time.sleep(2)
+
+
+       raise RuntimeError("Failed to download ONNX model after 3 attempts.")
+
+
+download_model()
+
+
+# === Load Tokenizer and ONNX Session ===
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+
+
+# === FastAPI App ===
 app = FastAPI()
 
-class Item(BaseModel):
-    id: str
-    text: str
 
-class ZeroShotRequest(BaseModel):
-    items: List[Item]
-    candidate_labels: List[str]
-    multi_label: bool = True
-    hypothesis_template: str = HYPOTHESIS_TEMPLATE
+process = psutil.Process(os.getpid())
 
-def kb(s: str) -> float:
-    return len(s.encode("utf-8")) / 1024
 
-def get_peak_mb() -> float:
-    p = psutil.Process(os.getpid())
-    cur = p.memory_info().rss / 1024 / 1024
-    if platform.system() == "Linux":
-        import resource
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    elif platform.system() == "Windows":
-        peak = getattr(p.memory_info(), "peak_wset", cur) / 1024 / 1024
-    else:
-        import resource
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
-    return max(cur, peak)
+class Comment(BaseModel):
+   id: str
+   body: str
+
+
+class CommentsRequest(BaseModel):
+   comments: List[Comment]
+
+
+# Background task to log memory usage every 10 seconds
+async def log_memory_usage():
+   while True:
+       mem_mb = process.memory_info().rss / (1024 * 1024)
+       logger.info(f"[MEMORY MONITOR] Current memory usage: {mem_mb:.2f} MB")
+       await asyncio.sleep(10)
+
+
+@app.on_event("startup")
+async def startup_event():
+   asyncio.create_task(log_memory_usage())
+
 
 @app.get("/")
-def root():
-    return {"message": "Moritz zero-shot ONNX backend running."}
+def health_check():
+   mem_mb = process.memory_info().rss / (1024 * 1024)
+   logger.info(f"[HEALTH CHECK] Memory usage: {mem_mb:.2f} MB")
+   return {
+       "status": "backend is alive",
+       "message": "Emotion ONNX model is running."
+   }
+
+
+@app.get("/warmup")
+def warmup():
+   logger.info("[WARMUP] Received warmup request")
+   return {"status": "warmed"}
+
+
+@app.get("/metrics")
+def get_metrics():
+    memory_info = process.memory_info()
+    return {
+        "memory_usage_mb": round(memory_info.rss / (1024 * 1024), 2),
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "num_threads": process.num_threads(),
+        "open_files": len(process.open_files()),
+        "connections": len(process.connections())
+    }
 
 @app.post("/predict")
-def predict(req: ZeroShotRequest):
+async def predict(request: CommentsRequest):
     try:
-        timings = {}
-        t0 = time.perf_counter()
-        p = psutil.Process(os.getpid())
-        mem0 = p.memory_info().rss / 1024 / 1024
+        initial_memory_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[PREDICT] Initial memory usage: {initial_memory_mb:.2f} MB")
 
-        total_data_size_kb = kb(req.model_dump_json())
+        request_json = request.model_dump()
+        request_bytes = json.dumps(request_json).encode("utf-8")
+        request_size_kb = len(request_bytes) / 1024
+        logger.info(f"[PREDICT] Request size: {request_size_kb:.2f} KB")
 
-        results = []
-        z0 = time.perf_counter()
-        for item in req.items:
-            hyps = [req.hypothesis_template.format(lbl) for lbl in req.candidate_labels]
+        texts = [c.body for c in request.comments]
+        ids = [c.id for c in request.comments]
 
-            enc = tokenizer(
-                [item.text] * len(hyps),
-                hyps,
-                return_tensors="np",
-                truncation=True,
-                padding=True,
-                max_length=512
-            )
+        async def stream_results():
+            total_response_bytes = 0
+            try:
+                for i in range(0, len(texts), BATCH_SIZE):
+                    batch_texts = texts[i : i + BATCH_SIZE]
+                    batch_ids = ids[i : i + BATCH_SIZE]
 
-            inputs = {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc["attention_mask"]
-            }
-            if "token_type_ids" in enc:
-                inputs["token_type_ids"] = enc["token_type_ids"]
-            else:
-                inputs["token_type_ids"] = np.zeros_like(enc["input_ids"])
+                    results_batch = [{} for _ in batch_texts]
 
-            t_infer0 = time.perf_counter()
-            logits = session.run(None, inputs)[0]  # (num_labels, 3)
-            t_infer1 = time.perf_counter()
+                    # Loop over your candidate pairs with hypotheses
+                    for (pos_label, neutral_label) in TOPIC_CANDIDATE_PAIRS:
+                        hypothesis_1 = HYPOTHESIS_TEMPLATES[pos_label]
+                        hypothesis_2 = HYPOTHESIS_TEMPLATES[neutral_label]
 
-            # stable softmax
-            logits = logits - np.max(logits, axis=1, keepdims=True)
-            exp = np.exp(logits)
-            probs = exp / np.sum(exp, axis=1, keepdims=True)
+                        encoded_batch = tokenizer(
+                            [text for text in batch_texts for _ in range(2)],
+                            [hypothesis_1, hypothesis_2] * len(batch_texts),
+                            return_tensors="np",
+                            padding=True,
+                            truncation=True,
+                            max_length=512,
+                        )
 
-            entail = probs[:, ENTAILMENT_IDX]
-            label_scores = list(zip(req.candidate_labels, entail.tolist()))
-            label_scores.sort(key=lambda x: x[1], reverse=True)
+                        onnx_inputs = {
+                            "input_ids": encoded_batch["input_ids"],
+                            "attention_mask": encoded_batch["attention_mask"],
+                        }
 
-            if req.multi_label:
-                top_label, top_score = None, None
-            else:
-                top_label, top_score = label_scores[0]
+                        logits = await asyncio.wait_for(
+                            asyncio.get_running_loop().run_in_executor(
+                                None, session.run, None, onnx_inputs
+                            ),
+                            timeout=TIMEOUT_SECONDS,
+                        )
+                        logits = logits[0]
 
-            results.append({
-                "id": item.id,
-                "text": item.text,
-                "top_label": top_label,
-                "top_score": round(float(top_score), 4) if top_score is not None else None,
-                "label_scores": {lbl: round(float(s), 4) for lbl, s in label_scores},
-                "forward_time": t_infer1 - t_infer0
-            })
+                        probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+                        entailment_probs = probs[:, 0]  # entailment score
 
-        z1 = time.perf_counter()
-        timings["zero_shot_total"] = z1 - z0
+                        for idx in range(len(batch_texts)):
+                            entail_pos = entailment_probs[idx * 2]
+                            entail_neutral = entailment_probs[idx * 2 + 1]
 
-        mem_peak = get_peak_mb()
+                            predicted_label = pos_label if entail_pos > entail_neutral else neutral_label
 
-        response = {
-            "model_used": MODEL_ID,
-            "multi_label": req.multi_label,
-            "candidate_labels": req.candidate_labels,
-            "results": results,
-            "memory_initial_mb": round(mem0, 2),
-            "memory_peak_mb": round(mem_peak, 2),
-        }
+                            results_batch[idx].setdefault("type", "result")
+                            results_batch[idx].setdefault("id", batch_ids[idx])
+                            results_batch[idx].setdefault("topics", [])
+                            results_batch[idx].setdefault("topic_scores", {})
 
-        total_return_kb = kb(json.dumps(response))
-        response["total_data_size_kb"] = round(total_data_size_kb, 2)
-        response["total_return_size_kb"] = round(total_return_kb, 2)
+                            # Add the detailed scores per task
+                            results_batch[idx]["topic_scores"][pos_label] = {
+                                "label": predicted_label,
+                                "entailment_score": round(float(entail_pos), 4),
+                                "neutral_score": round(float(entail_neutral), 4),
+                            }
 
-        timings["total_time"] = time.perf_counter() - t0
-        response["timing"] = timings
+                            # Add the predicted label to topics list if not already present
+                            if predicted_label not in results_batch[idx]["topics"]:
+                                results_batch[idx]["topics"].append(predicted_label)
 
-        return response
+                    # Yield each result line
+                    for result in results_batch:
+                        line = json.dumps(result) + "\n"
+                        total_response_bytes += len(line.encode("utf-8"))
+                        yield line
+
+                    current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"[PREDICT] Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
+
+                    # Clean up variables to help GC
+                    del batch_texts, batch_ids, encoded_batch, onnx_inputs, logits, probs
+                    gc.collect()
+
+                # Memory peak stats
+                current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                if platform.system() == "Windows":
+                    peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / (1024 * 1024)
+                elif platform.system() == "Linux":
+                    peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                elif platform.system() == "Darwin":
+                    peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+                else:
+                    peak_memory_mb = current_memory_mb
+
+                stats = {
+                    "type": "stats",
+                    "model_used": MODEL_ID,
+                    "memory_initial_mb": round(initial_memory_mb, 2),
+                    "memory_peak_mb": round(peak_memory_mb, 2),
+                    "total_data_size_kb": round(request_size_kb, 2),
+                    "total_return_size_kb": round(total_response_bytes / 1024, 2),
+                }
+
+                yield json.dumps(stats) + "\n"
+
+            except asyncio.CancelledError:
+                logger.warning("[PREDICT] Streaming task was cancelled — likely due to Render timeout.")
+                raise HTTPException(status_code=504, detail="Task was cancelled by host")
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="application/x-ndjson",
+            headers={"Connection": "keep-alive"},
+        )
+
     except Exception as e:
-        traceback.print_exc()
+        logger.error("[PREDICT] Exception during prediction", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

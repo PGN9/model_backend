@@ -21,7 +21,7 @@ MODEL_ID = "bhadresh-savani/distilbert-base-uncased-emotion"
 ONNX_MODEL_URL = "https://huggingface.co/Ndi2020/bhadresh-emotion-onnx/resolve/main/model-quant.onnx"
 ONNX_MODEL_PATH = "./onnx_model/model-quant.onnx"
 LABELS = ["sadness", "joy", "love", "anger", "fear", "surprise"]
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 THRESHOLD = 0.3
 TIMEOUT_SECONDS = 300  # Render hard timeout
 
@@ -108,10 +108,10 @@ async def predict(request: CommentsRequest):
     try:
         initial_memory_mb = process.memory_info().rss / (1024 * 1024)
         logger.info(f"[PREDICT] Initial memory usage: {initial_memory_mb:.2f} MB")
-
-        if initial_memory_mb > 480:
-            logger.warning("[PREDICT] Memory pressure too high — rejecting request")
-            return JSONResponse(status_code=503, content={"error": "Memory pressure too high"})
+        
+        #if initial_memory_mb > 480:
+        #    logger.warning("[PREDICT] Memory pressure too high — rejecting request")
+        #    return JSONResponse(status_code=503, content={"error": "Memory pressure too high"})
 
         request_json = request.model_dump()
         request_bytes = json.dumps(request_json).encode("utf-8")
@@ -164,6 +164,7 @@ async def predict(request: CommentsRequest):
                         }
 
                         line = json.dumps(result) + "\n"
+                        
                         total_response_bytes += len(line.encode("utf-8"))
                         yield line
 

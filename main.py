@@ -196,8 +196,8 @@ async def predict(request: CommentsRequest):
 
                             results_batch[idx].setdefault("type", "result")
                             results_batch[idx].setdefault("id", batch_ids[idx])
-                            results_batch[idx].setdefault("topic_scores", {})
                             results_batch[idx].setdefault("topics", [])
+                            results_batch[idx].setdefault("topic_scores", {})
 
                             # Add the detailed scores per task
                             results_batch[idx]["topic_scores"][pos_label] = {

@@ -22,7 +22,7 @@ import resource
 # === Config ===
 MODEL_ID = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
 ONNX_MODEL_URL = "https://huggingface.co/Ndi2020/MoritzLaurermultilingual-MiniLMv2-L6-mnli-xnli/resolve/main/model.onnx"
-ONNX_MODEL_PATH = "./onnx_model/model.onnx"
+ONNX_MODEL_PATH = "./onnx_model/Moritz_model.onnx"
 LABELS = ["entailment", "neutral", "contradiction"]  # typical M-NLI outputs
 
 # Each pair defines a task: [positive_label, neutral_label]

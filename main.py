@@ -183,13 +183,15 @@ async def predict(request: CommentsRequest):
                             asyncio.get_running_loop().run_in_executor(None, session.run, None, onnx_inputs),
                             timeout=TIMEOUT_SECONDS
                         )
+                        logits_array = logits[0]  # unwrap list
 
-                        probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
-                        entailment_probs = probs[:, 0]  # entailment score
-
+                        # Calculate softmax along classes axis (axis=1)
+                        exp_logits = np.exp(logits_array)
+                        probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+                        
                         for idx in range(len(batch_texts)):
-                            entail_pos = entailment_probs[idx * 2]
-                            entail_neutral = entailment_probs[idx * 2 + 1]
+                            entail_pos = probs[idx * 2, 0]     # row idx*2, class 0 (entail_pos)
+                            entail_neutral = probs[idx * 2 + 1, 0]  # row idx*2+1, class 0 (entail_neutral)
 
                             predicted_label = pos_label if entail_pos > entail_neutral else neutral_label
 
@@ -198,7 +200,6 @@ async def predict(request: CommentsRequest):
                             results_batch[idx].setdefault("topics", [])
                             results_batch[idx].setdefault("topic_scores", {})
 
-                            # Add the detailed scores per task
                             results_batch[idx]["topic_scores"][pos_label] = {
                                 "label": predicted_label,
                                 "entailment_score": round(float(entail_pos), 4),

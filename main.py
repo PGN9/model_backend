@@ -37,8 +37,7 @@ HYPOTHESIS_TEMPLATES = {
     "neutral (goal)": "This text does not express any goal or desire."
 }
 
-BATCH_SIZE = 16
-THRESHOLD = 0.3
+BATCH_SIZE = 1 # do it one by one
 TIMEOUT_SECONDS = 300  # Render hard timeout
 
 

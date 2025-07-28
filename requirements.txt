@@ -8,3 +8,4 @@ torch
 onnx
 optimum
 onnxruntime
+sklearn

@@ -20,7 +20,7 @@ import resource
 # === Config ===
 MODEL_ID = "valhalla/distilbart-mnli-12-1"
 ONNX_MODEL_URL = "https://huggingface.co/Ayeshas21/valhalla-distilbart-mnli-12-1/resolve/main/model-quant.onnx"
-ONNX_MODEL_PATH = "./onnx_model/model-quant.onnx"
+ONNX_MODEL_PATH = "./onnx_model/valhalla-model-quant.onnx"
 LABELS = ["entailment", "neutral", "contradiction"]  # typical M-NLI outputs
 
 # Each pair defines a task: [positive_label, neutral_label]

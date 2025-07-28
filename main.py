@@ -159,7 +159,7 @@ def predict(req: EmotionRequest):
             "memory_initial_mb": round(mem0, 2),
             "memory_peak_mb": round(mem_peak, 2),
             "total_data_size_kb": round(total_data_size_kb, 2),
-            total_return_size_kb": round(sys.getsizeof(json.dumps(response))/1024, 2)
+             "total_return_size_kb": round(sys.getsizeof(json.dumps(response))/1024, 2)
         }
 
         timings["total_time"] = time.perf_counter() - t0

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 fastapi
 uvicorn
 pydantic
@@ -6,3 +7,11 @@ onnxruntime
 psutil
 numpy
 requests
+=======
+fastapi
+uvicorn
+pydantic
+transformers==4.39.3
+torch
+psutil
+>>>>>>> 98087b3d9c1e05ac42a6313d30e1cb516a592d83

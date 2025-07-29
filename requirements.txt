@@ -1,5 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
-vaderSentiment
+transformers
+onnxruntime
+numpy
+requests
 psutil

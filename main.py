@@ -143,7 +143,11 @@ async def predict(request: CommentsRequest):
                     "attention_mask": inputs["attention_mask"]
                 }
 
-                logits = (await asyncio.to_thread(session.run, None, onnx_inputs))[0]
+                import functools
+
+                loop = asyncio.get_event_loop()
+                logits = (await loop.run_in_executor(None, functools.partial(session.run, None, onnx_inputs)))[0]
+
                 probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
                 preds = np.argmax(probs, axis=1)
 

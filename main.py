@@ -72,7 +72,11 @@ def mean_pool(token_embeddings, attention_mask):
 
 def embed_text(text, tokenizer, session):
     inputs = tokenizer(text, return_tensors="np", padding="max_length", truncation=True, max_length=128)
-    onnx_inputs = {k: v.astype(np.int64) for k, v in inputs.items()}
+
+    onnx_inputs = {
+        "input_ids": inputs["input_ids"].astype(np.int64),
+        "attention_mask": inputs["attention_mask"].astype(np.int64)
+    }
     outputs = session.run(None, onnx_inputs)
     embedding = outputs[0]
     if len(embedding.shape) == 3:  # token embeddings
@@ -99,7 +103,7 @@ class CommentsRequest(BaseModel):
 # Background task to log memory usage every 10 seconds, add sample memory usage every 1 second
 # === Memory monitor globals ===
 total_memory_time = 0.0  # this is total memory, not time
-_sample_interval = 0.0001  # seconds
+_sample_interval = 0.1  # seconds
 _log_interval = 10  # seconds
 
 async def log_and_sample_memory_usage():

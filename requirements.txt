@@ -1,9 +1,9 @@
 fastapi
 uvicorn
 pydantic
-vaderSentiment
-psutil
-sentence_transformers
-onnx
-optimum
+transformers
 onnxruntime
+numpy
+scikit-learn
+requests
+psutil

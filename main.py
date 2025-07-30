@@ -1,106 +1,93 @@
-from fastapi import FastAPI
+# for local test
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
-from fastapi.responses import JSONResponse
-import os
-import time
-import psutil
-import traceback
-import platform
-import json
+from typing import List
+from fastapi.responses import JSONResponse, StreamingResponse
+from transformers import AutoTokenizer
+import onnxruntime as ort
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
-import warnings
 import requests
-warnings.filterwarnings('ignore')
+import os
+import json
+import gc
+import logging
+import psutil
+import time
+import asyncio
+import platform
+import resource
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-request_count = 0
-start_time = time.time()
 
+
+
+# === Config ===
+MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+ONNX_MODEL_URL = "https://huggingface.co/Ayeshas21/sentence-transformers-all-MiniLM-L6-v2-quantized/resolve/main/model-quant.onnx"
+ONNX_MODEL_PATH = "./onnx_model/sentencetransformers-model-quant.onnx"
+
+TARGET = "I'm facing an issue I can't resolve."
+SIMILARITY_THRESHOLD = 0.3
+
+BATCH_SIZE = 16
+TIMEOUT_SECONDS = 300  # Render hard timeout
+
+# === Setup Logging ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("sentence-transformer-model")
+
+
+# === Ensure Model Exists (with retry) ===
+def download_model():
+    if not os.path.exists(ONNX_MODEL_PATH):
+        logger.info("Downloading quantized ONNX model...")
+        os.makedirs(os.path.dirname(ONNX_MODEL_PATH), exist_ok=True)
+
+        for attempt in range(3):
+            try:
+                response = requests.get(ONNX_MODEL_URL, timeout=60)
+                response.raise_for_status()
+                with open(ONNX_MODEL_PATH, "wb") as f:
+                    f.write(response.content)
+                logger.info("Model downloaded successfully.")
+                return
+            except Exception as e:
+                logger.warning(f"Attempt {attempt+1}/3 failed: {e}")
+                time.sleep(2)
+
+        raise RuntimeError("Failed to download ONNX model after 3 attempts.")
+
+download_model()
+
+# === Load Tokenizer and ONNX Session ===
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+
+
+# === helper functions for clustering task ===
+def mean_pool(token_embeddings, attention_mask):
+    mask = attention_mask[..., np.newaxis]
+    return (token_embeddings * mask).sum(1) / mask.sum(1)
+
+def embed_text(text, tokenizer, session):
+    inputs = tokenizer(text, return_tensors="np", padding="max_length", truncation=True, max_length=128)
+    onnx_inputs = {k: v.astype(np.int64) for k, v in inputs.items()}
+    outputs = session.run(None, onnx_inputs)
+    embedding = outputs[0]
+    if len(embedding.shape) == 3:  # token embeddings
+        embedding = mean_pool(embedding, inputs["attention_mask"])
+    return embedding
+
+# Embed the target sentence once
+target_embedding = embed_text(TARGET, tokenizer, session)
+
+
+
+# === FastAPI App ===
 app = FastAPI()
 
-# Model loading with fallback options
-MODEL_TYPE = "unknown"
-model = None
-onnx_session = None
-tokenizer = None
-
-def download_quantized_model():
-    """Download the quantized model from your Hugging Face repo"""
-    model_name = "Ayeshas21/sentence-transformers-all-MiniLM-L6-v2-quantized"
-    filename = "model-quant.onnx"
-    
-    if os.path.exists(filename):
-        print(f"✅ {filename} already exists, skipping download")
-        return filename
-    
-    try:
-        url = f"https://huggingface.co/{model_name}/resolve/main/{filename}"
-        print(f"📥 Downloading quantized model from {url}...")
-        
-        response = requests.get(url, timeout=300)
-        response.raise_for_status()
-        
-        with open(filename, 'wb') as f:
-            f.write(response.content)
-        
-        print(f"✅ Downloaded {filename} ({len(response.content)} bytes)")
-        return filename
-    except Exception as e:
-        print(f"❌ Failed to download quantized model: {e}")
-        return None
-
-def load_model():
-    """Load the best available model with fallback options"""
-    global model, onnx_session, tokenizer, MODEL_TYPE
-    
-    # Option 1: Try to load quantized ONNX model
-    try:
-        model_path = download_quantized_model()
-        if model_path and os.path.exists(model_path):
-            import onnxruntime as ort
-            from transformers import AutoTokenizer
-            
-            print("🔄 Loading quantized ONNX model...")
-            onnx_session = ort.InferenceSession(model_path)
-            tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-            MODEL_TYPE = "quantized-onnx"
-            print("✅ Quantized ONNX model loaded successfully!")
-            return
-    except ImportError:
-        print("⚠️ ONNX Runtime not available, trying alternatives...")
-    except Exception as e:
-        print(f"⚠️ Failed to load quantized model: {e}")
-    
-    # Option 2: Try smaller SentenceTransformer models
-    smaller_models = [
-        "sentence-transformers/paraphrase-MiniLM-L3-v2",  # 17MB
-        "sentence-transformers/paraphrase-MiniLM-L6-v2",  # 23MB
-        "sentence-transformers/all-MiniLM-L12-v2",        # 33MB
-        "sentence-transformers/all-MiniLM-L6-v2"          # 90MB (original)
-    ]
-    
-    for model_name in smaller_models:
-        try:
-            print(f"🔄 Trying to load {model_name}...")
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(model_name)
-            MODEL_TYPE = f"sentence-transformer-{model_name.split('/')[-1]}"
-            print(f"✅ Loaded {model_name} successfully!")
-            return
-        except Exception as e:
-            print(f"⚠️ Failed to load {model_name}: {e}")
-            continue
-    
-    raise RuntimeError("❌ Failed to load any model!")
-
-# Load model on startup
-try:
-    load_model()
-except Exception as e:
-    print(f"❌ Critical error loading model: {e}")
-    # You might want to exit here or use a very basic fallback
+process = psutil.Process(os.getpid())
 
 class Comment(BaseModel):
     id: str
@@ -108,222 +95,164 @@ class Comment(BaseModel):
 
 class CommentsRequest(BaseModel):
     comments: List[Comment]
-    n_clusters: Optional[int] = None
 
-def get_size_in_kb(data):
-    return len(data.encode('utf-8')) / 1024
+# Background task to log memory usage every 10 seconds, add sample memory usage every 1 second
+# === Memory monitor globals ===
+total_memory_time = 0.0  # this is total memory, not time
+_sample_interval = 0.0001  # seconds
+_log_interval = 10  # seconds
 
-def encode_texts_quantized(texts: List[str]) -> np.ndarray:
-    """Encode texts using quantized ONNX model"""
-    all_embeddings = []
-    
-    for text in texts:
-        inputs = tokenizer(text, return_tensors="np", padding=True, truncation=True, max_length=512)
-        
-        outputs = onnx_session.run(None, {
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs["attention_mask"]
-        })
-        
-        # Apply mean pooling
-        last_hidden_state = outputs[0]
-        attention_mask_expanded = np.expand_dims(inputs["attention_mask"], -1)
-        attention_mask_expanded = np.broadcast_to(attention_mask_expanded, last_hidden_state.shape)
-        
-        masked_embeddings = last_hidden_state * attention_mask_expanded
-        summed = np.sum(masked_embeddings, axis=1)
-        summed_mask = np.sum(attention_mask_expanded, axis=1)
-        embedding = summed / np.maximum(summed_mask, 1e-9)
-        
-        all_embeddings.append(embedding[0])
-    
-    return np.array(all_embeddings)
+async def log_and_sample_memory_usage():
+    global total_memory_time
+    elapsed = 0
 
-def encode_texts(texts: List[str]) -> np.ndarray:
-    """Encode texts using the loaded model"""
-    if MODEL_TYPE == "quantized-onnx":
-        return encode_texts_quantized(texts)
-    else:
-        return model.encode(texts)
+    while True:
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        total_memory_time += mem_mb * _sample_interval
+        elapsed += _sample_interval
 
-def determine_optimal_clusters(embeddings, max_clusters=10):
-    """Determine optimal number of clusters using the elbow method"""
-    n_samples = len(embeddings)
-    max_clusters = min(max_clusters, n_samples - 1, 10)
-    
-    if n_samples <= 2:
-        return 1
-    elif n_samples <= 5:
-        return min(2, n_samples - 1)
-    
-    inertias = []
-    K_range = range(1, max_clusters + 1)
-    
-    for k in K_range:
-        if k >= n_samples:
-            break
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(embeddings)
-        inertias.append(kmeans.inertia_)
-    
-    if len(inertias) < 3:
-        return len(inertias)
-    
-    deltas = [inertias[i] - inertias[i+1] for i in range(len(inertias)-1)]
-    delta_deltas = [deltas[i] - deltas[i+1] for i in range(len(deltas)-1)]
-    
-    if delta_deltas:
-        elbow_idx = delta_deltas.index(max(delta_deltas)) + 2
-        return min(elbow_idx, len(inertias))
-    
-    return min(3, len(inertias))
+        if elapsed >= _log_interval:
+            logging.info(
+                f"[MEMORY MONITOR] Current memory: {mem_mb:.2f} MB | "
+                f"Total memory-time: {total_memory_time:.2f} MB·s"
+            )
+            elapsed = 0
 
-def perform_clustering(embeddings, n_clusters=None):
-    """Perform K-means clustering on embeddings"""
-    if len(embeddings) <= 1:
-        return [0], np.array([[0.0]])
-    
-    if n_clusters is None:
-        n_clusters = determine_optimal_clusters(embeddings)
-    else:
-        n_clusters = min(n_clusters, len(embeddings))
-    
-    if n_clusters <= 1:
-        return [0] * len(embeddings), np.array([[1.0]])
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(embeddings)
-    
-    cluster_centers = kmeans.cluster_centers_
-    distances = []
-    for i, embedding in enumerate(embeddings):
-        cluster_id = cluster_labels[i]
-        distance = cosine_similarity([embedding], [cluster_centers[cluster_id]])[0][0]
-        distances.append(distance)
-    
-    return cluster_labels.tolist(), distances
+        await asyncio.sleep(_sample_interval)
+        
 
-def get_cluster_topics(embeddings, texts, cluster_labels, n_clusters):
-    """Generate topic keywords for each cluster"""
-    cluster_topics = {}
-    
-    for cluster_id in range(n_clusters):
-        cluster_texts = [texts[i] for i in range(len(texts)) if cluster_labels[i] == cluster_id]
-        
-        if not cluster_texts:
-            cluster_topics[cluster_id] = []
-            continue
-        
-        from collections import Counter
-        import re
-        
-        combined_text = ' '.join(cluster_texts).lower()
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', combined_text)
-        
-        stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 
-                     'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 
-                     'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 
-                     'boy', 'did', 'she', 'use', 'say', 'each', 'which', 'their', 'time', 
-                     'will', 'about', 'would', 'there', 'could', 'other', 'after', 'first', 
-                     'well', 'many', 'some', 'what', 'with', 'have', 'this', 'that', 'they',
-                     'been', 'said', 'very', 'were', 'more', 'than', 'also', 'back', 'only',
-                     'come', 'work', 'life', 'even', 'right', 'down', 'years', 'think', 'where'}
-        
-        filtered_words = [word for word in words if word not in stop_words and len(word) > 3]
-        word_counts = Counter(filtered_words)
-        top_keywords = [word for word, count in word_counts.most_common(5)]
-        cluster_topics[cluster_id] = top_keywords
-    
-    return cluster_topics
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(log_and_sample_memory_usage())
 
 @app.get("/")
-def root():
+def health_check():
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    logger.info(f"[HEALTH CHECK] Memory usage: {mem_mb:.2f} MB")
     return {
-        "message": "Optimized SentenceTransformer clustering backend is running.",
-        "model_type": MODEL_TYPE,
-        "status": "ready" if (model or onnx_session) else "error"
+        "status": "backend is alive",
+        "message": "sentence transformer ONNX model is running."
+    }
+
+@app.get("/warmup")
+def warmup():
+    logger.info("[WARMUP] Received warmup request")
+    return {"status": "warmed"}
+
+@app.get("/metrics")
+def get_metrics():
+    memory_info = process.memory_info()
+    return {
+        "memory_usage_mb": round(memory_info.rss / (1024 * 1024), 2),
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "num_threads": process.num_threads(),
+        "open_files": len(process.open_files()),
+        "connections": len(process.connections())
     }
 
 @app.post("/predict")
-def cluster_comments(request: CommentsRequest):
+async def predict(request: CommentsRequest):
+    global total_memory_time
+
     try:
-        process = psutil.Process(os.getpid())
-        initial_memory_mb = process.memory_info().rss / 1024 / 1024 
-        input_json = json.dumps(request.model_dump()) if hasattr(request, "json") else str(request)
-        total_data_size_kb = get_size_in_kb(input_json)
+        total_memory_time = 0
+        initial_memory_mb = process.memory_info().rss / (1024 * 1024)
+        logger.info(f"[PREDICT] Initial memory usage: {initial_memory_mb:.2f} MB")
+        
+        request_json = request.model_dump()
+        request_bytes = json.dumps(request_json).encode("utf-8")
+        request_size_kb = len(request_bytes) / 1024
+        logger.info(f"[PREDICT] Request size: {request_size_kb:.2f} KB")
 
-        texts = [comment.body for comment in request.comments]
-        
-        # Generate embeddings
-        embeddings = encode_texts(texts)
-        
-        cluster_labels, similarity_scores = perform_clustering(embeddings, request.n_clusters)
-        n_clusters = len(set(cluster_labels))
-        
-        cluster_topics = get_cluster_topics(embeddings, texts, cluster_labels, n_clusters)
-        
-        results = []
-        for i, comment in enumerate(request.comments):
-            cluster_id = cluster_labels[i]
-            similarity_score = similarity_scores[i]
-            
-            results.append({
-                "id": comment.id,
-                "body": comment.body,
-                "cluster": cluster_id,
-                "similarity_to_cluster": round(float(similarity_score), 4),
-                "cluster_topics": cluster_topics.get(cluster_id, []),
-                "embedding_dim": len(embeddings[i])
-            })
+        texts = [c.body for c in request.comments]
+        ids = [c.id for c in request.comments]
 
-        current_memory_mb = process.memory_info().rss / 1024 / 1024
-        if platform.system() == "Windows":
-            peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / 1024 / 1024
-        elif platform.system() == "Linux":
-            import resource
-            peak_memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            peak_memory_mb = peak_memory_kb / 1024
-        elif platform.system() == "Darwin":
-            import resource
-            peak_memory_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            peak_memory_mb = peak_memory_bytes / 1024 / 1024
-        else:
-            peak_memory_mb = current_memory_mb
+        async def stream_results():
+            total_response_bytes = 0
+            try:
+                for i in range(0, len(texts), BATCH_SIZE):
+                    batch_texts = texts[i:i + BATCH_SIZE]
+                    batch_ids = ids[i:i + BATCH_SIZE]
 
-        cluster_stats = {}
-        for cluster_id in range(n_clusters):
-            cluster_size = cluster_labels.count(cluster_id)
-            cluster_stats[cluster_id] = {
-                "size": cluster_size,
-                "percentage": round((cluster_size / len(results)) * 100, 2),
-                "topics": cluster_topics.get(cluster_id, [])
-            }
+                    inputs = tokenizer(
+                        batch_texts,
+                        return_tensors="np",
+                        padding=True,
+                        truncation=True,
+                        max_length=128
+                    )
 
-        return_data = {
-            "model_used": f"{MODEL_TYPE}",
-            "clustering_algorithm": "K-Means",
-            "n_clusters": n_clusters,
-            "cluster_stats": cluster_stats,
-            "results": results,
-            "memory_initial_mb": round(initial_memory_mb, 2),
-            "memory_peak_mb": round(peak_memory_mb, 2)
-        }
-        
-        total_return_size_kb = get_size_in_kb(json.dumps(return_data))
-        return_data["total_data_size_kb"] = round(total_data_size_kb, 2)
-        return_data["total_return_size_kb"] = round(total_return_size_kb, 2)
-        return return_data
+                    onnx_inputs = {
+                        "input_ids": inputs["input_ids"].astype(np.int64),
+                        "attention_mask": inputs["attention_mask"].astype(np.int64)
+                    }
+                    try:
+                        loop = asyncio.get_running_loop()
+                        outputs = await asyncio.wait_for(
+                            loop.run_in_executor(None, session.run, None, onnx_inputs),
+                            timeout=TIMEOUT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("[PREDICT] Inference call timed out.")
+                        raise HTTPException(status_code=504, detail="Inference timed out")
+
+                    embeddings = outputs[0]  # shape: (batch_size, seq_len, hidden_size)
+
+                    # Use mean_pool on the batch
+                    pooled_embeddings = mean_pool(embeddings, inputs["attention_mask"])  # shape: (batch_size, hidden)
+
+                    for j, emb in enumerate(pooled_embeddings):
+                        sim = cosine_similarity([emb], target_embedding)[0][0]
+
+                        if sim >= SIMILARITY_THRESHOLD:
+                            result = {
+                                "type": "result",
+                                "id": batch_ids[j],
+                                "similarity": round(float(sim), 4),
+                            }
+                            line = json.dumps(result) + "\n"
+                            total_response_bytes += len(line.encode("utf-8"))
+                            yield line
+
+                    current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                    logger.info(f"[PREDICT] Processed batch of {len(batch_texts)} | Memory: {current_memory_mb:.2f} MB")
+
+                    del batch_texts, batch_ids, inputs, onnx_inputs, outputs, embeddings, pooled_embeddings
+                    gc.collect()
+
+                # Memory peak stats
+                current_memory_mb = process.memory_info().rss / (1024 * 1024)
+                if platform.system() == "Windows":
+                    peak_memory_mb = getattr(process.memory_info(), "peak_wset", current_memory_mb) / (1024 * 1024)
+                elif platform.system() == "Linux":
+                    peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                elif platform.system() == "Darwin":
+                    peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+                else:
+                    peak_memory_mb = current_memory_mb
+
+                stats = {
+                    "type": "stats",
+                    "model_used": MODEL_ID,
+                    "memory_initial_mb": round(initial_memory_mb, 2),
+                    "memory_peak_mb": round(peak_memory_mb, 2),
+                    "modelside_total_memory_mbs": total_memory_time,
+                    "total_data_size_kb": round(request_size_kb, 2),
+                    "total_return_size_kb": round(total_response_bytes / 1024, 2)
+                }
+
+                yield json.dumps(stats) + "\n"
+
+            except asyncio.CancelledError:
+                logger.warning("[PREDICT] Streaming task was cancelled — likely due to Render timeout.")
+                raise HTTPException(status_code=504, detail="Task was cancelled by host")
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="application/x-ndjson",
+            headers={"Connection": "keep-alive"}
+        )
 
     except Exception as e:
-        print("Error occurred:", str(e))
-        traceback.print_exc()
+        logger.error("[PREDICT] Exception during prediction", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.post("/analyze")
-def analyze_comments(request: CommentsRequest):
-    return cluster_comments(request)
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)

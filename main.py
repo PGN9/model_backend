@@ -72,24 +72,21 @@ class CommentsRequest(BaseModel):
 
 # Background task to log memory usage every 10 seconds, add sample memory usage every 1 second
 # === Memory monitor globals ===
-total_memory_time = 0.0  # this is total memory, not time
+memory_samples = []
 _sample_interval = 0.0001  # seconds
 _log_interval = 10  # seconds
 
 async def log_and_sample_memory_usage():
-    global total_memory_time
+    global memory_samples
     elapsed = 0
 
     while True:
         mem_mb = process.memory_info().rss / (1024 * 1024)
-        total_memory_time += mem_mb * _sample_interval
+        memory_samples.append(mem_mb)
         elapsed += _sample_interval
 
         if elapsed >= _log_interval:
-            logging.info(
-                f"[MEMORY MONITOR] Current memory: {mem_mb:.2f} MB | "
-                f"Total memory-time: {total_memory_time:.2f} MB·s"
-            )
+            logging.info(f"[MEMORY MONITOR] Current memory: {mem_mb:.2f} MB")
             elapsed = 0
 
         await asyncio.sleep(_sample_interval)
@@ -126,10 +123,11 @@ def get_metrics():
 
 @app.post("/predict")
 async def predict(request: CommentsRequest):
-    global total_memory_time
+    global memory_samples
 
     try:
-        total_memory_time = 0
+        memory_samples.clear()
+        overall_start = time.perf_counter()
         initial_memory_mb = process.memory_info().rss / (1024 * 1024)
         logger.info(f"[PREDICT] Initial memory usage: {initial_memory_mb:.2f} MB")
         
@@ -207,13 +205,17 @@ async def predict(request: CommentsRequest):
                     peak_memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
                 else:
                     peak_memory_mb = current_memory_mb
+                    
+                overall_end = time.perf_counter()
+                avg_memory = sum(memory_samples) / len(memory_samples)
+                gb_seconds = (avg_memory / 1024) * (overall_end - overall_start)
 
                 stats = {
                     "type": "stats",
                     "model_used": MODEL_ID,
                     "memory_initial_mb": round(initial_memory_mb, 2),
                     "memory_peak_mb": round(peak_memory_mb, 2),
-                    "modelside_total_memory_mbs": total_memory_time,
+                    "modelside_total_memory_gbs": gb_seconds,
                     "total_data_size_kb": round(request_size_kb, 2),
                     "total_return_size_kb": round(total_response_bytes / 1024, 2)
                 }
